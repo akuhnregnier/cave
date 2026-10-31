@@ -1,0 +1,6 @@
+#!/bin/bash
+# In the test image, ahead of the real git. `claude slow` makes `git add` take 4s per repo.
+if [ -e /tmp/slow-git ] && [ "$3" = add ]; then
+  sleep 4
+fi
+exec /usr/bin/git "$@"

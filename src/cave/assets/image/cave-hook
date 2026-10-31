@@ -1,0 +1,65 @@
+#!/bin/bash
+# Claude Code's way to hear from cave: cave-companion raises a flag, and the next of these
+# hooks to fire takes it and speaks once. Everything said here is fixed text. What other
+# sandboxes committed reaches this clone, so no commit text, ref or path may reach Claude
+# through a note.
+set -u
+export HOME=${CAVE_VM_HOME:-/home/claude}
+event=${1:-}
+input=$(cat)
+
+BRIEFING="cave: this is a disposable sandbox. Only your claude/ branch comes back to the host, as committed work while \
+you run and with the rest committed for you when you exit, and the user reviews it with cave merge. origin is a \
+read-only copy of the host's main that cave keeps current. Rebase onto it, never merge it: the host refuses merge commits. \
+To ask for another repo from the host, by its path relative to this folder, run cave-companion request add-repo <path>. \
+To ask for a review of your work so far, run cave-companion request review. Nothing happens until the user says yes on the host."
+UPDATE="cave: main moved on the host, and origin in this sandbox already has it. At a good point, rebase your branch \
+onto origin's main in any repo that is behind it. Do not merge it: the host refuses merge commits."
+RESOLVE="cave: a repo here could not land. origin has the current main: finish any merge or rebase under way, then \
+rebase your branch onto it, resolving any conflicts, and leave the result committed."
+ADDED="cave: a repo was added to this sandbox. It's where you asked for it or, if the user added it from elsewhere, \
+in /workspace/.cave-added."
+
+# Only one rm can win, however many hooks fire at once. RESOLVE covers what UPDATE says.
+take_note() {
+  local note=""
+  rm ~/.cave-update 2>/dev/null && note=$UPDATE
+  rm ~/.cave-note 2>/dev/null && note=$RESOLVE
+  rm ~/.cave-added 2>/dev/null && note="${note:+$note }$ADDED"
+  printf '%s' "$note"
+}
+
+# For `cave ls`. Failing to say costs nothing but a sandbox shown as unknown.
+set_status() {
+  local outbox=${CAVE_OUTBOX:-/cave/outbox}
+  { printf '%s\n' "$1" > "$outbox/.status.$$" && mv "$outbox/.status.$$" "$outbox/status"; } 2>/dev/null
+}
+
+add_context() {
+  jq -n --arg event "$event" --arg text "$1" '{hookSpecificOutput: {hookEventName: $event, additionalContext: $text}}'
+}
+
+case "$event" in
+  SessionStart)
+    set_status idle
+    note=$(take_note)
+    add_context "$BRIEFING${note:+ $note}"
+    ;;
+  UserPromptSubmit | PostToolUse)
+    set_status working
+    note=$(take_note)
+    [ -z "$note" ] || add_context "$note"
+    ;;
+  Stop)
+    # Claude is already carrying on because of a Stop hook, so let it stop. The flag waits for the next prompt.
+    if [ "$(jq '.stop_hook_active == true' <<<"$input" 2>/dev/null)" != true ]; then
+      note=$(take_note)
+      if [ -n "$note" ]; then
+        jq -n --arg reason "$note" '{decision: "block", reason: $reason}'
+        exit 0
+      fi
+    fi
+    set_status idle
+    ;;
+esac
+exit 0

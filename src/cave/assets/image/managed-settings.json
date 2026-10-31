@@ -1,0 +1,8 @@
+{
+  "hooks": {
+    "SessionStart": [{"hooks": [{"type": "command", "command": "/usr/local/bin/cave-hook SessionStart"}]}],
+    "UserPromptSubmit": [{"hooks": [{"type": "command", "command": "/usr/local/bin/cave-hook UserPromptSubmit"}]}],
+    "PostToolUse": [{"hooks": [{"type": "command", "command": "/usr/local/bin/cave-hook PostToolUse"}]}],
+    "Stop": [{"hooks": [{"type": "command", "command": "/usr/local/bin/cave-hook Stop"}]}]
+  }
+}

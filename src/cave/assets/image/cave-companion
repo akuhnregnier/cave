@@ -1,0 +1,285 @@
+#!/bin/bash
+# The guest side of cave. It's a convenience: the host verifies everything it writes.
+#   cave-companion token     keep the token on stdin for the entrypoint. It's held on a tmpfs.
+#   cave-companion setup     clone each repo from its bundle in the read-only inbox
+#   cave-companion bundle    put each repo's committed work in the outbox, until ~/.cave-final exists
+#   cave-companion --final   clear locks, commit what Claude left, then the same. Only once Claude is gone.
+#   cave-companion recover   --final in a fresh VM on the volume of one that died: no Claude, no clones
+#   cave-companion note      flag that Claude must rebase its branch: cave-hook has the words
+#   cave-companion fetch     take in each repo's newer main, if any, and flag it
+#   cave-companion watch     the same every few seconds, until the session's end kills it
+#   cave-companion add <repo>     clone a repo that joins the sandbox: a line of CAVE_REPOS
+#   cave-companion request review | add-repo <path relative to the workspace>
+#                            ask the user, who answers with `cave requests` on the host
+# It reports through files in the outbox. <key> comes from the host, never from a VM path:
+#   <key>.bundle    claude/<id> beyond the delivered main
+#   <key>.none      nothing beyond it
+#   <key>.busy      a merge or rebase is under way, or the session ended off claude/<id>, so
+#                   what is current is unclear: no bundle
+#   <key>.finished  the final snapshot of this repo worked
+#   <key>.embedded  repos created in the VM
+#   <key>.acked     the last main this clone took in, which the next update builds on
+#   <key>.need-full this clone can't take the update in the inbox, so it needs all of main
+#   <key>.dirty     how many files git status lists here, while the session runs
+#   strays          files outside every repo
+#   status          working or idle: cave-hook writes it
+#   request-<hex>   one line, as above. The host ignores anything else, and acts only on the user's yes
+set -u
+export HOME=${CAVE_VM_HOME:-/home/claude}
+mode=${1:-}
+outbox=${CAVE_OUTBOX:-/cave/outbox}
+
+# A path as a literal git ignore or find pattern.
+glob_escape() {
+  sed 's/[][*?\\]/\\&/g' <<<"$1"
+}
+
+# The bundle stays as origin, and a public origin, if any, as upstream.
+clone_repo() {
+  local repo=$1 entry=$2 key=$3 origin
+  git clone -q --single-branch --no-tags --branch "$(jq -r .base <<<"$entry")" "$(jq -r .bundle <<<"$entry")" "$repo" \
+    || return 1
+  git -C "$repo" update-ref refs/cave/delivered HEAD
+  git -C "$repo" rev-parse HEAD > "$outbox/$key.acked"
+  git -C "$repo" checkout -q -b "claude/$CAVE_ID"
+  origin=$(jq -r .origin <<<"$entry")
+  [ -z "$origin" ] || git -C "$repo" remote add upstream "$origin"
+  # Nested clones are repos of their own, so `git add -A` must not take them in.
+  mkdir -p "$repo/.git/info"
+  jq -r '.exclude[]' <<<"$entry" >> "$repo/.git/info/exclude"
+}
+
+# CAVE_RESUME means the volume has been in use, so a repo with no .git isn't new: it's broken,
+# and its files must not read as nothing to land. It stays out of the list and gets no report.
+setup() {
+  local entry key repo
+  git config --file ~/.gitconfig safe.directory '*'
+  git config --file ~/.gitconfig user.name "${CAVE_GIT_NAME:-Claude}"
+  git config --file ~/.gitconfig user.email "${CAVE_GIT_EMAIL:-noreply@anthropic.com}"
+  rm -f "$outbox/strays" "$outbox/status"
+  : > ~/.cave-repos.new
+  while read -r entry; do
+    repo=$(jq -r .path <<<"$entry")
+    key=$(jq -r .key <<<"$entry")
+    if [ -e "$repo/.git" ] || { [ -z "${CAVE_RESUME:-}" ] && clone_repo "$repo" "$entry" "$key"; }; then
+      rm -f "$outbox/$key.finished"
+      printf '%s\t%s\n' "$key" "$repo" >> ~/.cave-repos.new
+    elif [ -z "${CAVE_RESUME:-}" ]; then
+      # Nothing can land from a repo that never got here.
+      echo "cave: could not clone $repo, so this sandbox goes without it" >&2
+      : > "$outbox/$key.none"
+      : > "$outbox/$key.finished"
+    fi
+  done < <(jq -c '.[]' <<<"$CAVE_REPOS")
+  # Last, so that the other modes know the repos are ready once these exist.
+  echo "claude/$CAVE_ID" > ~/.cave-branch
+  mv ~/.cave-repos.new ~/.cave-repos
+}
+
+token() {
+  umask 077
+  IFS= read -r token && printf '%s\n' "$token" > /run/cave/.token && mv /run/cave/.token /run/cave/token
+}
+
+# What every other mode needs: the repos set up, and the outbox to write to.
+ready() {
+  if [ ! -r ~/.cave-repos ] || [ ! -r ~/.cave-branch ]; then
+    echo "cave: the sandbox isn't ready yet" >&2
+    exit 1
+  fi
+  cd "$outbox" || exit 1
+  branch=$(cat ~/.cave-branch)
+}
+
+# The new repo is kept out of any repo around it, as setup does for nested ones.
+add_repo() {
+  local entry=$1 repo key parent
+  repo=$(jq -r .path <<<"$entry")
+  key=$(jq -r .key <<<"$entry")
+  CAVE_ID=${branch#claude/} # an exec needn't have the VM's environment
+  grep -qxF "$key"$'\t'"$repo" ~/.cave-repos && return 0 # a retry of an add that finished
+  [ -e "$repo/.git" ] || clone_repo "$repo" "$entry" "$key" || return 1 # or one that was cut short
+  while IFS=$'\t' read -r _ parent; do
+    case "$repo" in
+      "$parent"/*)
+        mkdir -p "$parent/.git/info"
+        printf '/%s/\n' "$(glob_escape "${repo#"$parent"/}")" >> "$parent/.git/info/exclude"
+        ;;
+    esac
+  done < ~/.cave-repos
+  printf '%s\t%s\n' "$key" "$repo" >> ~/.cave-repos
+  : > ~/.cave-added
+}
+
+request() {
+  local name
+  name=request-$(od -An -N8 -tx1 /dev/urandom | tr -d ' \n')
+  printf '%s\n' "$1" > ".$name" && mv ".$name" "$name" && echo "cave: asked. The user answers on the host."
+}
+
+ask() {
+  case "${1:-}" in
+    review) request review ;;
+    add-repo) [ -n "${2:-}" ] && request "add-repo $2" ;;
+    *) false ;;
+  esac || { echo "usage: cave-companion request review | add-repo <path>" >&2; exit 2; }
+}
+
+# Moves only origin's main: rebasing onto it is for Claude to do, when it suits.
+# A bundle that can't be read here is one this clone lacks the start of, so it asks for all.
+fetch_update() {
+  local bundle="${CAVE_INBOX:-/cave/inbox}/$1.bundle" head tip source
+  head=$(git -C "$2" bundle list-heads "$bundle" 2>/dev/null) && [ -n "$head" ] || return 0
+  tip=${head%% *} source=${head#* }
+  [ "$(cat "$1.acked" 2>/dev/null)" != "$tip" ] || return 0
+  if git -C "$2" -c core.hooksPath=/dev/null fetch -q --no-tags --no-recurse-submodules --no-write-fetch-head \
+    --no-auto-maintenance "$bundle" "+$source:refs/remotes/origin/${source#refs/heads/}" 2>/dev/null; then
+    echo "$tip" > "$1.acked"
+    : > ~/.cave-update
+  elif ! git -C "$2" bundle verify -q "$bundle" > /dev/null 2>&1; then
+    : > "$1.need-full"
+  fi
+}
+
+# Only for `cave ls`, and it never takes a lock Claude's git could trip on.
+report_dirty() {
+  local listed temp=".$1.dirty.$$"
+  if listed=$(git -C "$2" --no-optional-locks status --porcelain 2>/dev/null); then
+    printf '%s' "$listed" | grep -c '' > "$temp"
+    mv "$temp" "$1.dirty"
+  else
+    rm -f "$1.dirty"
+  fi
+}
+
+# watch waits first, as a session told to resolve starts with a git fetch that this would collide with.
+update_loop() {
+  while :; do
+    [ "$mode" = fetch ] || sleep 5
+    while IFS=$'\t' read -r key repo; do
+      fetch_update "$key" "$repo"
+      report_dirty "$key" "$repo"
+    done < ~/.cave-repos
+    [ "$mode" = watch ] || return 0
+  done
+}
+
+operation_in_progress() {
+  local name
+  for name in MERGE_HEAD CHERRY_PICK_HEAD REVERT_HEAD BISECT_LOG rebase-merge rebase-apply; do
+    [ -e "$1/.git/$name" ] && return 0
+  done
+  return 1
+}
+
+# Moving HEAD to $branch would commit the whole gap to the tree here as WIP, undoing work
+# that lives on $branch, so it's for Claude to get back. A repo too broken to say isn't this.
+off_branch() {
+  local head
+  head=$(git -C "$1" rev-parse --symbolic-full-name HEAD 2>/dev/null) && [ "$head" != "refs/heads/$branch" ]
+}
+
+# git would record a repo created in the VM as a gitlink to a commit the host never
+# gets, and its files would be lost. Keep it out, and tell the host.
+leave_out_embedded_repos() {
+  local path
+  while IFS= read -r -d '' path; do
+    case "$path" in
+      */)
+        printf '/%s\n' "$(glob_escape "$path")" >> "$1/.git/info/exclude"
+        printf '%s\n' "$path" >> "$2.embedded"
+        ;;
+    esac
+  done < <(git -C "$1" ls-files -o --exclude-standard -z)
+}
+
+snapshot() {
+  leave_out_embedded_repos "$1" "$2"
+  git -C "$1" add -A \
+    && { git -C "$1" diff --cached --quiet \
+         || git -C "$1" -c core.hooksPath=/dev/null commit -q -m WIP; }
+}
+
+# refs/cave/delivered is the main the host gave this clone, so the host has all it needs.
+write_bundle() {
+  local ahead temp=".$2.$$"
+  rm -f "$2.bundle" "$2.none"
+  ahead=$(git -C "$1" rev-list --count "refs/cave/delivered..refs/heads/$branch") || return 1
+  if [ "$ahead" = 0 ]; then
+    : > "$2.none"
+  elif git -C "$1" bundle create -q "$PWD/$temp" "refs/heads/$branch" ^refs/cave/delivered; then
+    mv "$temp" "$2.bundle"
+  else
+    rm -f "$temp"
+    return 1
+  fi
+}
+
+report_strays() {
+  local skip=() found key repo temp=".strays.$$" volume=${CAVE_VOLUME:-/workspace}
+  while IFS=$'\t' read -r key repo; do
+    skip+=(-o -path "$(glob_escape "$repo")")
+  done < ~/.cave-repos
+  # The whole volume, not only the workspace; cave's own folder and the unreadable lost+found are not Claude's.
+  for name in .cave-config .cave-added lost+found; do skip+=(-o -path "$volume/$name"); done
+  # A volume of millions of files must not outlast the stop budget (CLAUDE.md), so find gets
+  # CAVE_STRAYS_SECONDS (the image's coreutils have timeout). Cut short, no strays file is written, which the
+  # host reads as the VM never saying.
+  local limit=()
+  command -v timeout > /dev/null && limit=(timeout -k 1 "${CAVE_STRAYS_SECONDS:-6}")
+  ${limit[@]+"${limit[@]}"} find "$volume" \( -false "${skip[@]}" \) -prune -o ! -type d -print \
+    | cut -c"$((${#volume} + 2))-" > "$temp"
+  found=("${PIPESTATUS[@]}")
+  if [ "${found[0]}" -ge 124 ] || [ "${found[1]}" != 0 ]; then
+    rm -f "$temp"
+    return 1
+  fi
+  mv "$temp" strays
+}
+
+# The key goes first, as the last field keeps whatever a path holds.
+report_all() {
+  local key repo status=0
+  while IFS=$'\t' read -r key repo; do
+    rm -f "$key.busy"
+    # A killed git leaves its locks behind. Nothing else is running, so none of them are live.
+    [ "$mode" = --final ] && find "$repo/.git" -name '*.lock' -type f -delete 2>/dev/null
+    if operation_in_progress "$repo" || { [ "$mode" = --final ] && off_branch "$repo"; }; then
+      echo "cave: $repo has a merge or rebase in progress, or is off $branch, so it was skipped" >&2
+      rm -f "$key.bundle" "$key.none"
+      : > "$key.busy"
+    elif [ "$mode" = --final ] && ! snapshot "$repo" "$key"; then
+      status=1
+    elif ! write_bundle "$repo" "$key"; then
+      status=1
+    elif [ "$mode" = --final ]; then
+      : > "$key.finished"
+    fi
+  done < ~/.cave-repos
+  # A repo that failed has no report, which tells the host. Only a missing answer is an error.
+  [ "$mode" = bundle ] && return 0
+  report_strays || status=1
+  return "$status"
+}
+
+case "$mode" in
+  token) token ;;
+  setup) setup ;;
+  note) ready && : > ~/.cave-note ;;
+  add) ready && add_repo "${2:-}" ;;
+  request) ready && ask "${@:2}" ;;
+  fetch | watch) ready && update_loop ;;
+  # A bundle left over from before the WIP commit must never replace the one that has it.
+  bundle) ready && { [ ! -e ~/.cave-final ] || { echo "cave: the final snapshot has begun" >&2; exit 1; }; } && report_all ;;
+  --final) ready && report_all ;;
+  recover)
+    : > ~/.cave-final # ahead of setup, so that no bundle can start beside the snapshot
+    setup
+    mode=--final
+    ready && report_all
+    ;;
+  *)
+    echo "usage: cave-companion token | setup | bundle | --final | recover | note | fetch | watch | add | request" >&2
+    exit 2
+    ;;
+esac

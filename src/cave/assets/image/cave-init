@@ -1,0 +1,7 @@
+#!/bin/sh
+# Runs in the VM as root, only for what the runtime mounts as root. `exec` keeps the
+# entrypoint as PID 1, where it gets the stop signals.
+chown claude:claude /workspace /run/cave
+chmod 700 /run/cave
+export HOME=/home/claude
+exec setpriv --reuid=claude --regid=claude --init-groups /usr/local/bin/cave-entrypoint "$@"

@@ -1,0 +1,12 @@
+{
+  "name": "cave-config",
+  "owner": {
+    "name": "cave"
+  },
+  "plugins": [
+    {
+      "name": "cave-config",
+      "source": "./plugins/cave-config"
+    }
+  ]
+}
