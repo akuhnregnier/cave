@@ -7,9 +7,9 @@ token_file=/run/cave/token
 mkdir -p "$config" "$CAVE_WORKSPACE"
 cave-companion setup
 
-# The repo's settings.json and CLAUDE.md are copied in; cave's required settings win.
+# The repo's cave-settings.json and CLAUDE.md are copied in; cave's required settings win.
 settings=/dev/null
-[ -f "$config/settings.json" ] && settings="$config/settings.json"
+[ -f "$config/cave-settings.json" ] && settings="$config/cave-settings.json"
 jq -s 'add // {} | . * {
   enableAllProjectMcpServers: true,
   skipDangerousModePermissionPrompt: true,

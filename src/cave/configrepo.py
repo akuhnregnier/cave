@@ -7,7 +7,8 @@ from cave.git import git
 from cave.paths import config_repo
 
 TEMPLATE = Path(__file__).parent / "assets" / "config"
-FLAGGED = ("settings.json", "plugins/", "Dockerfile", ".claude-plugin/")  # these reach the host and every later VM
+# these reach the host (host-settings.json, plugins/, .claude-plugin/) or every later VM (cave-settings.json, Dockerfile, plugins/)
+FLAGGED = ("cave-settings.json", "host-settings.json", "plugins/", "Dockerfile", ".claude-plugin/")
 
 
 def init():

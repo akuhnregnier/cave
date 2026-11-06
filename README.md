@@ -198,18 +198,22 @@ plugin marketplace, and `cave init` creates it:
 ```
 .claude-plugin/marketplace.json
 plugins/cave-config/       skills, agents, commands, hooks, .mcp.json, assets
-settings.json              copied to the VM's ~/.claude
+cave-settings.json         merged into the VM's ~/.claude/settings.json; cave's required settings win
+host-settings.json         not used by cave; symlink the host's ~/.claude/settings.json to it
 CLAUDE.md                  copied to the VM's ~/.claude
 Dockerfile                 your image layer, FROM cave-base:latest
 ```
 
 To use the same config on the host:
 `claude plugin marketplace add ~/.config/cave/config`.
+To share host settings, symlink `~/.claude/settings.json` to `host-settings.json`. Host Claude
+Code writes to that file, so those writes land in the config checkout: commit or revert
+them before `cave merge` can land into it.
 
 Each sandbox gets its own clone of this repo and loads every folder in `plugins/`.
 Changes come back through `cave merge`, like any other repo's, and the host loads them
 from the next session. Claude wrote them in an unrestricted VM, so review them closely,
-especially `plugins/`, `settings.json` and `Dockerfile`, which the report flags through
+especially `plugins/`, `cave-settings.json`, `host-settings.json` and `Dockerfile`, which the report flags through
 the `cave.flagged` git config that `cave init` sets.
 
 Images rebuild when the `Dockerfile` changes. They are tagged `cave:<build date>-<hash>`,

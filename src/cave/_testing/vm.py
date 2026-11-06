@@ -96,7 +96,7 @@ def install_stub_claude(harness):
     # The image hash only covers the Dockerfile, so a changed stub must change it too.
     stub_hash = hashlib.sha256(b"".join((config / name).read_bytes() for _, name in stubs)).hexdigest()
     (config / "Dockerfile").write_text(f"{(HERE / 'stub.Dockerfile').read_text()}# stubs {stub_hash}\n")
-    (config / "settings.json").write_text('{"enableAllProjectMcpServers": false, "model": "sonnet", '
+    (config / "cave-settings.json").write_text('{"enableAllProjectMcpServers": false, "model": "sonnet", '
                                           '"sandbox": {"enabled": true, "x": 1}}\n')
     (config / "CLAUDE.md").write_text("# test instructions\n")
     harness.git("add", "-A", repo=config)
